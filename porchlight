@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Porchlight - firewall approvals grouped by WHO is asking.
+
+A phone-friendly user interface for the OpenSnitch application firewall. OpenSnitch's daemon holds every new outbound
+connection and asks its UI; Porchlight is that UI. Instead of one pop-up per program and address it sorts each request
+into a group - your carrier, the system, a desktop app, an Android app (Waydroid), something unknown - asks ONCE per
+group in plain words ("Your carrier (AT&T) wants to connect"), and stores the answer as one rule for the whole group.
+
+Run it in the graphical session instead of opensnitch-ui (same socket, unix:///tmp/osui.sock). Settings:
+/etc/porchlight/groups.json (system) and ~/.config/porchlight/groups.json (user) extend the built-in groups.
+"""
+import glob, json, os, queue, re, shlex, subprocess, sys, threading, time
+from concurrent import futures
+
+sys.path.insert(0, "/usr/lib/python3/dist-packages")
+import grpc
+from opensnitch.proto import ui_pb2, ui_pb2_grpc   # OpenSnitch's own protocol (python3-opensnitch-ui)
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+SOCKET = os.environ.get("PORCHLIGHT_SOCKET", "unix:///tmp/osui.sock")
+TIMEOUT = int(os.environ.get("PORCHLIGHT_TIMEOUT", "30"))       # seconds; unanswered = deny (OpenSnitch's way)
+VERSION = "0.1.0"
+
+# --- who is asking --------------------------------------------------------------------------------------------------
+# Built-in groups: (id, title template, matcher). A matcher sees the connection and returns True when it belongs.
+CARRIER_PROCS = ("ModemManager", "qmicli", "mbimcli", "ofonod", "rmtfs", "tqftpserv", "pd-mapper", "imsd")
+SYSTEM_PROCS = ("apt", "apt-get", "http", "https", "unattended-upgrade", "systemd-timesyncd", "NetworkManager",
+                "avahi-daemon", "fwupd", "packagekitd", "flatpak", "snapd", "chronyd", "ntpd", "cupsd",
+                "waydroid")   # Waydroid's own tool (image updates); Android apps themselves are the "android" group
+DEFAULT_GROUPS = {
+    "carrier": {"title": "Your carrier ({carrier}) wants to connect",
+                "why": "Mobile network services: the modem, SMS/MMS, voice over LTE, carrier settings.",
+                "processes": list(CARRIER_PROCS)},
+    "system": {"title": "The system wants to connect",
+               "why": "Updates, the clock, network checks and local name discovery.",
+               "processes": list(SYSTEM_PROCS)},
+    # Android apps' traffic is FORWARDED from Waydroid's bridge, not sent by a local program: OpenSnitch does not see
+    # it yet. This group is for when the bridge is queued too (the Android uid -> package name).
+    "android": {"title": "An Android app wants to connect",
+                "why": "An app inside Waydroid (the Android container).",
+                "processes": []},
+}
+
+def load_groups():
+    groups = json.loads(json.dumps(DEFAULT_GROUPS))
+    for p in ("/etc/porchlight/groups.json", os.path.expanduser("~/.config/porchlight/groups.json")):
+        try:
+            for k, v in json.load(open(p)).items():
+                groups.setdefault(k, {}).update(v)
+        except (OSError, ValueError):
+            pass
+    return groups
+
+def carrier_name():
+    """the operator name the SIM / network reports (ModemManager), else a neutral word"""
+    try:
+        out = subprocess.run(["mmcli", "-m", "any", "--output-keyvalue"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if line.startswith("modem.3gpp.operator-name"):
+                name = line.split(":", 1)[1].strip()
+                if name and name != "--":
+                    return name
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "mobile network"
+
+_apps = None
+def desktop_apps():
+    """executable (resolved) -> (app name, icon) from the installed .desktop files"""
+    global _apps
+    if _apps is not None:
+        return _apps
+    _apps = {}
+    for d in ("/usr/share/applications", "/usr/local/share/applications", os.path.expanduser("~/.local/share/applications")):
+        for f in glob.glob(d + "/*.desktop"):
+            name = icon = exe = None; nodisplay = False
+            try:
+                for line in open(f, errors="replace"):
+                    if line.startswith("[") and line.strip() != "[Desktop Entry]" and name:
+                        break
+                    if line.startswith("Name=") and not name: name = line[5:].strip()
+                    elif line.startswith("Icon="): icon = line[5:].strip()
+                    elif line.startswith("Exec=") and not exe:
+                        try: exe = shlex.split(line[5:].strip())[0]
+                        except ValueError: exe = line[5:].split()[0]
+                        if exe == "env":   # Exec=env VAR=x prog ...
+                            exe = next((w for w in shlex.split(line[5:].strip())[1:] if "=" not in w), None)
+                    elif line.startswith("NoDisplay=true"): nodisplay = True
+            except OSError:
+                continue
+            if not exe or not name:
+                continue
+            path = exe if exe.startswith("/") else (subprocess.run(["sh", "-c", 'command -v "$0"', exe],
+                                                                   capture_output=True, text=True).stdout.strip())
+            if path:
+                real = os.path.realpath(path)
+                for k in {path, real}:
+                    if k not in _apps or not nodisplay:
+                        _apps[k] = (name, icon)
+    return _apps
+
+def app_for(conn):
+    """the desktop app a connection belongs to: the process itself, or the app whose files it runs from"""
+    apps = desktop_apps()
+    p = conn.process_path
+    if p in apps:
+        return apps[p]
+    # helper processes of an app (chromium's network service, code's utility process): same install folder
+    for exe, info in apps.items():
+        base = os.path.dirname(os.path.realpath(exe))
+        if base not in ("/usr/bin", "/bin", "/usr/sbin", "/usr/local/bin") and p.startswith(base + "/"):
+            return info
+    # launchers that are wrapper scripts (/usr/bin/chromium -> /usr/lib/chromium/chromium): same program name
+    for exe, info in apps.items():
+        if os.path.basename(exe) == os.path.basename(p):
+            return info
+    return None
+
+INTERPRETERS = re.compile(r"^(python[0-9.]*|perl|ruby|node|sh|bash|dash)$")
+
+def classify(conn, groups):
+    """-> (group id, title, why, (operand, regexp) or None): the rule the answer becomes for the whole group.
+    Scripts (python, sh, ...) are named by their script, and their rules match the command line - a rule on the
+    interpreter's path would cover every script."""
+    name = os.path.basename(conn.process_path)
+    words = list(conn.process_args)          # a repeated field (argv), not a string
+    script = None
+    if INTERPRETERS.match(name):
+        it = iter(words[1:])
+        for w in it:
+            if w == "-c":                       # inline code: no script to name
+                break
+            if w == "-m":                       # python -m module
+                script = next(it, None); break
+            if not w.startswith("-"):
+                script = os.path.basename(w); break
+    who = script or name
+    for gid, g in groups.items():
+        procs = g.get("processes", [])
+        if who in procs:
+            title = g["title"].format(carrier=carrier_name() if gid == "carrier" else "", app=who)
+            alt = "|".join(re.escape(x) for x in sorted(set(procs)))
+            if script:
+                return gid, title, g.get("why", ""), ("process.command", r"^\S*/?(%s)( |$)|^\S+ (\S*/)?(%s)( |$)" % (alt, alt))
+            return gid, title, g.get("why", ""), ("process.path", r"^(.*/)?(%s)$" % alt)
+    app = app_for(conn)
+    if app:
+        return "app:" + app[0], "%s wants to connect" % app[0], "An app you installed.", None
+    return "unknown", "Something unknown wants to connect", "A program that is not an installed app: %s" % who, None
+
+# --- the card -------------------------------------------------------------------------------------------------------
+class Card(QtWidgets.QWidget):
+    answered = QtCore.pyqtSignal(object, str, str)     # request, action (allow/deny), duration (once/always)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Porchlight")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+        v = QtWidgets.QVBoxLayout(self); v.setContentsMargins(28, 28, 28, 28); v.setSpacing(14)
+        self.title = QtWidgets.QLabel(); self.title.setWordWrap(True)
+        f = self.title.font(); f.setPointSizeF(f.pointSizeF() * 1.7); f.setBold(True); self.title.setFont(f)
+        self.why = QtWidgets.QLabel(); self.why.setWordWrap(True)
+        self.where = QtWidgets.QLabel(); self.where.setWordWrap(True)
+        self.details = QtWidgets.QLabel(); self.details.setWordWrap(True)
+        self.details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse); self.details.hide()
+        more = QtWidgets.QPushButton("Details"); more.setFlat(True); more.clicked.connect(lambda: self.details.setVisible(not self.details.isVisible()))
+        self.always = QtWidgets.QCheckBox("Remember for this whole group"); self.always.setChecked(True)
+        self.count = QtWidgets.QLabel()
+        b = QtWidgets.QHBoxLayout()
+        self.deny = QtWidgets.QPushButton("Deny"); self.allow = QtWidgets.QPushButton("Allow")
+        for btn in (self.deny, self.allow):
+            btn.setMinimumHeight(96); fb = btn.font(); fb.setPointSizeF(fb.pointSizeF() * 1.5); btn.setFont(fb); b.addWidget(btn)
+        self.allow.setDefault(True)
+        self.deny.clicked.connect(lambda: self.answer("deny")); self.allow.clicked.connect(lambda: self.answer("allow"))
+        for w in (self.title, self.why, self.where, more, self.details):
+            v.addWidget(w)
+        v.addStretch(1); v.addWidget(self.always); v.addWidget(self.count); v.addLayout(b)
+        self.req = None; self.left = 0
+        self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self.tick)
+
+    def show_request(self, req):
+        self.req = req
+        c = req["conn"]
+        host = c.dst_host or c.dst_ip
+        self.title.setText(req["title"])
+        self.why.setText(req["why"])
+        self.where.setText("to <b>%s</b> (port %d, %s)" % (host, c.dst_port, c.protocol))
+        self.details.setText("program: %s\ncommand: %s\nuser: %d   process: %d\nfrom %s:%d to %s:%d" % (
+            c.process_path, " ".join(c.process_args)[:300], c.user_id, c.process_id, c.src_ip, c.src_port, c.dst_ip, c.dst_port))
+        self.always.setText("Remember for this whole group" if req["rule_data"] else "Remember for this app")
+        self.left = TIMEOUT; self.tick(); self.timer.start(1000)
+        self.showMaximized(); self.raise_(); self.activateWindow()
+
+    def tick(self):
+        self.count.setText("No answer in %d s = Deny" % self.left)
+        self.left -= 1
+        if self.left < 0:
+            self.answer("deny", timed_out=True)
+
+    def answer(self, action, timed_out=False):
+        if not self.req:
+            return
+        self.timer.stop(); req, self.req = self.req, None
+        self.hide()
+        self.answered.emit(req, action, "once" if timed_out or not self.always.isChecked() else "always")
+
+# --- the OpenSnitch UI service --------------------------------------------------------------------------------------
+class Service(ui_pb2_grpc.UIServicer):
+    def __init__(self, bridge):
+        self.bridge = bridge; self.groups = load_groups(); self.lock = threading.Lock()
+
+    def Ping(self, request, context):
+        return ui_pb2.PingReply(id=request.id)
+
+    def Subscribe(self, request, context):
+        print("daemon connected: %s %s" % (request.name, request.version), flush=True)
+        return request
+
+    def Notifications(self, request_iterator, context):
+        for _ in request_iterator:      # keep the stream open; Porchlight sends no commands to the daemon
+            pass
+        return iter(())
+
+    def PostAlert(self, request, context):
+        return ui_pb2.MsgResponse(id=request.id)
+
+    def AskRule(self, conn, context):
+        gid, title, why, rule_data = classify(conn, self.groups)
+        with self.lock:                  # one card at a time; the others wait their turn
+            done = queue.Queue()
+            self.bridge.ask.emit({"conn": conn, "group": gid, "title": title, "why": why, "rule_data": rule_data, "done": done})
+            try:
+                action, duration = done.get(timeout=TIMEOUT + 15)
+            except queue.Empty:
+                action, duration = "deny", "once"
+        return make_rule(conn, gid, rule_data, action, duration)
+
+def make_rule(conn, gid, rule_data, action, duration):
+    if rule_data:          # the whole group: every program in it
+        op = ui_pb2.Operator(type="regexp", operand=rule_data[0], data=rule_data[1], sensitive=False)
+        name = "porchlight-%s-%s" % (action, gid)
+    else:                  # one app / one unknown program
+        op = ui_pb2.Operator(type="simple", operand="process.path", data=conn.process_path, sensitive=False)
+        name = "porchlight-%s-%s" % (action, re.sub(r"[^a-z0-9]+", "-", os.path.basename(conn.process_path).lower()))
+    print("%s %s -> %s:%d: %s (%s)" % (gid, conn.process_path, conn.dst_host or conn.dst_ip, conn.dst_port, action, duration), flush=True)
+    return ui_pb2.Rule(created=int(time.time()), name=name, description="Porchlight: %s" % gid, enabled=True,
+                       precedence=False, nolog=False, action=action, duration=duration, operator=op)
+
+class Bridge(QtCore.QObject):
+    ask = QtCore.pyqtSignal(object)
+
+def main():
+    if "--version" in sys.argv:
+        print("porchlight", VERSION); return
+    app = QtWidgets.QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
+    card = Card(); bridge = Bridge(); waiting = []
+    def ask(req):
+        waiting.append(req)
+        if not card.req:
+            card.show_request(waiting.pop(0))
+    def answered(req, action, duration):
+        req["done"].put((action, duration))
+        if waiting:
+            card.show_request(waiting.pop(0))
+    bridge.ask.connect(ask); card.answered.connect(answered)
+    path = SOCKET.split("unix://", 1)[-1]
+    if os.path.exists(path):
+        os.unlink(path)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    ui_pb2_grpc.add_UIServicer_to_server(Service(bridge), server)
+    server.add_insecure_port(SOCKET); server.start()
+    print("porchlight %s listening on %s" % (VERSION, SOCKET), flush=True)
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
