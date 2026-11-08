@@ -255,6 +255,9 @@ def main():
     if "--version" in sys.argv:
         print("porchlight", VERSION); return
     app = QtWidgets.QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
+    # the Wayland app id: KWin's window rule (install.sh) keeps cards with this id ABOVE other windows - Qt's
+    # stay-on-top hint is ignored for normal Wayland windows and a card behind the browser just timed out to deny
+    app.setDesktopFileName("porchlight")
     card = Card(); bridge = Bridge(); waiting = []
     def ask(req):
         waiting.append(req)
